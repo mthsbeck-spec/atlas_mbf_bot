@@ -1,0 +1,7 @@
+services:
+  assistente:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/data          # token do Microsoft 365 + banco SQLite (faça backup)
+    restart: unless-stopped
