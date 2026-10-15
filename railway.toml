@@ -1,0 +1,7 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+numReplicas = 1                 # bot do Telegram por polling: sempre 1 instância
+restartPolicyType = "ALWAYS"
