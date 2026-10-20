@@ -38,6 +38,10 @@ class Config:
     anthropic_api_key: str = field(default_factory=lambda: _env("ANTHROPIC_API_KEY", ""))
     modelo: str = field(default_factory=lambda: _env("CLAUDE_MODEL", "claude-sonnet-4-5"))
 
+    # Transcrição de voz (OpenAI)
+    openai_api_key: str = field(default_factory=lambda: _env("OPENAI_API_KEY", ""))
+    modelo_transcricao: str = field(default_factory=lambda: _env("TRANSCRICAO_MODELO", "gpt-4o-transcribe"))
+
     # Microsoft 365 (registro de app no Entra ID / Azure AD)
     ms_client_id: str = field(default_factory=lambda: _env("MS_CLIENT_ID", ""))
     ms_tenant_id: str = field(default_factory=lambda: _env("MS_TENANT_ID", "organizations"))

@@ -17,6 +17,7 @@ from .armazenamento import Armazenamento
 from .config import Config
 from .graph import Autenticador, ErroGraph, Graph
 from .rotinas import Rotinas
+from .transcricao import ErroTranscricao, Transcritor
 
 log = logging.getLogger(__name__)
 LIMITE_TG = 4000
@@ -46,6 +47,7 @@ class Bot:
         self.graph = Graph(Autenticador(cfg.ms_client_id, cfg.ms_tenant_id, cfg.arquivo_token), cfg.fuso.key)
         self.agente = Agente(cfg, self.graph, self.banco)
         self.rotinas = Rotinas(self.agente)
+        self.transcritor = Transcritor(cfg.openai_api_key, cfg.modelo_transcricao, cfg.contatos_prioritarios)
         self.trava = asyncio.Lock()  # uma conversa por vez, para manter o histórico coerente
 
     # ------------------------------------------------------------ envio
@@ -76,7 +78,32 @@ class Bot:
         await self._rodar(ctx.application, "conversa", lambda: self.agente.conversar(texto))
 
     async def h_audio(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.message.reply_text("Ainda não entendo áudio — mande por texto, por favor.")
+        """Mensagem de voz/áudio: baixa do Telegram, transcreve e trata como texto."""
+        msg = update.message
+        if not self.transcritor.ativo:
+            await msg.reply_text("Para entender áudio, configure OPENAI_API_KEY nas variáveis do Railway.")
+            return
+        midia = msg.voice or msg.audio
+        if midia.file_size and midia.file_size > 20 * 1024 * 1024:
+            await msg.reply_text("Áudio grande demais para o Telegram me entregar (máx. 20 MB).")
+            return
+        await ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+        try:
+            arquivo = await midia.get_file()
+            audio = bytes(await arquivo.download_as_bytearray())
+            nome = getattr(midia, "file_name", None) or "voz.ogg"
+            if nome.lower().endswith(".oga"):
+                nome = nome[:-4] + ".ogg"
+            texto = await self.transcritor.transcrever(audio, nome)
+        except ErroTranscricao as e:
+            await msg.reply_text(f"⚠️ {e}")
+            return
+        except Exception as e:
+            log.exception("Falha ao transcrever")
+            await msg.reply_text(f"⚠️ Falha ao transcrever o áudio: {e}")
+            return
+        await msg.reply_text(f"🎙️ Entendi: “{texto}”")
+        await self._rodar(ctx.application, "conversa", lambda: self.agente.conversar(texto))
 
     async def h_botao(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -202,9 +229,16 @@ class Bot:
         jq.run_repeating(self.j_reunioes, interval=timedelta(minutes=5), first=20, name="reunioes")
 
         async def ao_iniciar(_app: Application) -> None:
-            if not self.graph.auth.conectado():
-                await _app.bot.send_message(self.cfg.chat_id_autorizado,
-                                            "Estou no ar, mas ainda sem acesso ao seu Outlook. Mande /login.")
+            eu = await _app.bot.get_me()
+            log.info("Bot @%s no ar. Chat autorizado: %s", eu.username, self.cfg.chat_id_autorizado)
+            msg = ("Estou no ar. ✅ Outlook conectado." if self.graph.auth.conectado()
+                   else "Estou no ar, mas ainda sem acesso ao seu Outlook. Mande /login.")
+            try:
+                await _app.bot.send_message(self.cfg.chat_id_autorizado, msg)
+            except Exception as e:  # não derruba o bot: só avisa no log
+                log.warning("Não consegui mandar mensagem para o chat %s (%s). Abra o bot @%s no Telegram, "
+                            "toque em Iniciar/Start e confira se TELEGRAM_CHAT_ID é o seu Id do @userinfobot.",
+                            self.cfg.chat_id_autorizado, e, eu.username)
         app.post_init = ao_iniciar
 
         async def ao_parar(_app: Application) -> None:
