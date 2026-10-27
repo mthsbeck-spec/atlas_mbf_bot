@@ -5,14 +5,11 @@ O Claude ainda pode usar as ferramentas para aprofundar (ex.: ler um e-mail inte
 """
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta, timezone
 
+from . import compacto
 from .agente import Agente, Resposta
 
-
-def _json(x) -> str:
-    return json.dumps(x, ensure_ascii=False, default=str)
 
 
 def _filtrar_ruido(emails: list[dict], ignorar: list[str]) -> list[dict]:
@@ -25,6 +22,13 @@ class Rotinas:
         self.ag = agente
         self.cfg = agente.cfg
         self.g = agente.graph
+        self.refs = agente.refs
+
+    def _em(self, lista: list[dict], **kw) -> str:
+        return compacto.emails(lista, self.refs, self.cfg.fuso, **kw)
+
+    async def _ev(self, lista: list[dict], **kw) -> str:
+        return compacto.eventos(lista, self.refs, await self.g.meu_email(), **kw)
 
     def _hoje(self) -> tuple[datetime, datetime]:
         agora = datetime.now(self.cfg.fuso)
@@ -58,9 +62,14 @@ Formato (texto simples, curto, para ler no celular):
 
 Termine perguntando se ele quer que você responda ou agende algo. Se uma seção estiver vazia, omita.
 
-AGENDA DE HOJE: {_json(agenda)}
-E-MAILS RECEBIDOS (últimos {janela} dia(s), sem relatórios/newsletters): {_json(emails)}
-ENVIADOS SEM RESPOSTA: {_json(sem_resposta)}"""
+AGENDA DE HOJE:
+{await self._ev(agenda)}
+
+E-MAILS RECEBIDOS (últimos {janela} dia(s), sem relatórios/newsletters):
+{self._em(emails)}
+
+ENVIADOS SEM RESPOSTA:
+{compacto.sem_resposta(sem_resposta, self.refs)}"""
         return await self.ag.conversar(prompt, rotulo_historico="[Rotina] Gere meu briefing matinal.",
                                      origem="briefing")
 
@@ -78,8 +87,11 @@ Para os que parecem importantes, ofereça redigir um follow-up curto.
 
 Seja seletivo: no máximo 8 itens no total. Se não houver nada relevante, diga isso em uma linha.
 
-ENVIADOS SEM RESPOSTA: {_json(sem_resposta)}
-RECEBIDOS NÃO RESPONDIDOS (7 dias): {_json(nao_respondidos)}"""
+ENVIADOS SEM RESPOSTA:
+{compacto.sem_resposta(sem_resposta, self.refs)}
+
+RECEBIDOS NÃO RESPONDIDOS (7 dias):
+{self._em(nao_respondidos, previa=100)}"""
         return await self.ag.conversar(prompt, rotulo_historico="[Rotina] Liste minhas pendências de e-mail.",
                                      origem="pendencias")
 
@@ -102,11 +114,20 @@ RECEBIDOS NÃO RESPONDIDOS (7 dias): {_json(nao_respondidos)}"""
 
 Curto e objetivo.
 
-REUNIÕES HOJE: {_json(hoje)}
-E-MAILS ENVIADOS HOJE: {_json(enviados)}
-RECEBIDOS HOJE: {_json(recebidos)}
-AINDA SEM RESPOSTA DELE: {_json(nao_respondidos)}
-AGENDA DO PRÓXIMO DIA ÚTIL: {_json(amanha)}"""
+REUNIÕES HOJE:
+{await self._ev(hoje)}
+
+E-MAILS ENVIADOS HOJE:
+{self._em(enviados, enviados=True, previa=0)}
+
+RECEBIDOS HOJE:
+{self._em(recebidos, previa=80)}
+
+AINDA SEM RESPOSTA DELE:
+{self._em(nao_respondidos, previa=0)}
+
+AGENDA DO PRÓXIMO DIA ÚTIL:
+{await self._ev(amanha)}"""
         return await self.ag.conversar(prompt, rotulo_historico="[Rotina] Gere meu resumo de fim de dia.",
                                      origem="fim_dia")
 
@@ -131,8 +152,8 @@ AGENDA DO PRÓXIMO DIA ÚTIL: {_json(amanha)}"""
         self.ag.banco.registrar_aviso(f"reuniao:{evento['id']}:{evento['inicio']}")
         prompt = f"""Daqui a pouco o Matheus tem esta reunião. Prepare-o em até ~12 linhas.
 
-Antes de escrever, use buscar_emails (pasta '' = todas, dias 30) com o assunto da reunião e com from:<participante> \
-dos principais participantes, para achar o contexto recente. Leia o e-mail mais relevante se precisar.
+Antes de escrever, faça no máximo 2 buscas com buscar_emails (pasta '' = todas, dias 30, limite 8): uma pelo \
+assunto da reunião e outra pelo participante principal. Leia um e-mail inteiro só se a prévia não bastar.
 
 Formato:
 🗓 <HH:MM> <título> (<online/local>)
@@ -141,7 +162,8 @@ Formato:
 ❓ Pontos em aberto / o que ele precisa decidir ou levar
 🔗 link da reunião, se houver
 
-REUNIÃO: {_json(evento)}"""
+REUNIÃO:
+{await self._ev([evento], detalhado=True)}"""
         return await self.ag.conversar(prompt, rotulo_historico=f"[Rotina] Prepare-me para a reunião "
                                                                 f"'{evento['titulo']}' das {evento['inicio'][11:16]}.",
                                      origem="reuniao")

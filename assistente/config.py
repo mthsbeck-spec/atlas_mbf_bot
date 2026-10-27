@@ -37,6 +37,8 @@ class Config:
     # Claude
     anthropic_api_key: str = field(default_factory=lambda: _env("ANTHROPIC_API_KEY", ""))
     modelo: str = field(default_factory=lambda: _env("CLAUDE_MODEL", "claude-sonnet-4-5"))
+    # Modelo mais barato para as rotinas automáticas (briefing, pendências, fim do dia, reuniões)
+    modelo_rotinas: str = field(default_factory=lambda: _env("CLAUDE_MODEL_ROTINAS", "claude-haiku-4-5"))
 
     # Transcrição de voz (OpenAI)
     openai_api_key: str = field(default_factory=lambda: _env("OPENAI_API_KEY", ""))

@@ -11,6 +11,7 @@ from anthropic import AsyncAnthropic
 
 from .armazenamento import Armazenamento
 from .config import Config
+from . import compacto
 from .gestao import Gestor
 from .graph import ErroGraph, Graph
 
@@ -29,11 +30,11 @@ FERRAMENTAS: list[dict] = [
                                                       "pasta. Use '' para todas as pastas."},
             "dias": {"type": "integer", "description": "Janela em dias (padrão 7)"},
             "apenas_nao_lidos": {"type": "boolean"},
-            "limite": {"type": "integer", "description": "Máx. 50 (padrão 15)"}}},
+            "limite": {"type": "integer", "description": "Máx. 25 (padrão 10)"}}},
     },
     {
         "name": "ler_email",
-        "description": "Lê o conteúdo completo de um e-mail pelo id.",
+        "description": "Lê o conteúdo completo de um e-mail pela referência (ex.: m3f9a1c2).",
         "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
     },
     {
@@ -120,6 +121,7 @@ class Agente:
                  gestor: Gestor | None = None):
         self.cfg, self.graph, self.banco = cfg, graph, banco
         self.gestor = gestor or Gestor(cfg, banco)
+        self.refs = compacto.Referencias(banco)
         self.claude = cliente or AsyncAnthropic(api_key=cfg.anthropic_api_key)
 
     # ---------------- prompt de sistema
@@ -141,7 +143,11 @@ enviado ou criado; diga que está aguardando a confirmação dele.
 - Prioridades dele: assinaturas pendentes e temas {", ".join(self.cfg.temas_prioritarios)}; \
 mensagens de {", ".join(self.cfg.contatos_prioritarios)}.
 - Ignore relatórios automáticos e newsletters, a menos que ele pergunte.
-- Datas e horas sempre no horário de Brasília."""
+- Datas e horas sempre no horário de Brasília.
+- E-mails e eventos vêm com uma referência curta entre colchetes, ex.: [m3f9a1c2] ou [e7b20d41]. Use essa \
+referência nos campos id/id_evento das ferramentas. Não mostre as referências ao Matheus.
+- Seja econômico: só chame ferramentas quando precisar, peça poucos resultados (limite) e só leia um e-mail \
+inteiro quando a prévia não bastar."""
         return [
             {"type": "text", "text": fixo, "cache_control": {"type": "ephemeral"}},
             {"type": "text", "text": f"Agora: {dias[agora.weekday()]}, {agora:%d/%m/%Y %H:%M}."},
@@ -156,16 +162,17 @@ mensagens de {", ".join(self.cfg.contatos_prioritarios)}.
         acoes: list[dict] = []
         final = ""
         for _ in range(MAX_PASSOS):
+            modelo = self.gestor.modelo_para(origem)
             try:
                 r = await self.claude.messages.create(
-                    model=self.cfg.modelo, max_tokens=2000, system=self._sistema(),
-                    tools=FERRAMENTAS, messages=msgs)
+                    model=modelo, max_tokens=2000, system=self._sistema(),
+                    tools=FERRAMENTAS, messages=_com_cache(msgs))
             except Exception as e:
                 self.gestor.status("claude", False, str(e))
                 raise
             self.gestor.status("claude", True)
             if getattr(r, "usage", None) is not None:
-                self.gestor.registrar_claude(self.cfg.modelo, r.usage, origem)
+                self.gestor.registrar_claude(modelo, r.usage, origem)
             msgs.append({"role": "assistant", "content": r.content})
             if r.stop_reason != "tool_use":
                 final = "".join(b.text for b in r.content if b.type == "text").strip()
@@ -176,8 +183,9 @@ mensagens de {", ".join(self.cfg.contatos_prioritarios)}.
                     continue
                 try:
                     saida = await self._executar(bloco.name, bloco.input, acoes)
-                    resultados.append({"type": "tool_result", "tool_use_id": bloco.id,
-                                       "content": json.dumps(saida, ensure_ascii=False, default=str)})
+                    conteudo = saida if isinstance(saida, str) else json.dumps(
+                        saida, ensure_ascii=False, default=str, separators=(",", ":"))
+                    resultados.append({"type": "tool_result", "tool_use_id": bloco.id, "content": conteudo})
                 except Exception as e:  # erro volta ao Claude para ele explicar/contornar
                     log.exception("Erro na ferramenta %s", bloco.name)
                     resultados.append({"type": "tool_result", "tool_use_id": bloco.id,
@@ -194,19 +202,26 @@ mensagens de {", ".join(self.cfg.contatos_prioritarios)}.
     # ---------------- despacho das ferramentas
     async def _executar(self, nome: str, a: dict[str, Any], acoes: list[dict]) -> Any:
         g, fuso = self.graph, self.cfg.fuso
+        a = dict(a)
+        for campo in ("id", "id_evento"):  # referências curtas → IDs do Outlook
+            if campo in a:
+                a[campo] = self.refs.resolver(str(a[campo]))
         if nome == "buscar_emails":
-            return await g.buscar_emails(a.get("texto"), a.get("pasta", "inbox"), a.get("dias", 7),
-                                         a.get("apenas_nao_lidos", False), a.get("limite", 15))
+            pasta = a.get("pasta", "inbox")
+            lista = await g.buscar_emails(a.get("texto"), pasta, a.get("dias", 7),
+                                          a.get("apenas_nao_lidos", False), min(a.get("limite", 10), 25))
+            return compacto.emails(lista, self.refs, fuso, enviados=pasta == "sentitems")
         if nome == "ler_email":
-            return await g.ler_email(a["id"])
+            return compacto.email_completo(await g.ler_email(a["id"]), self.refs, fuso)
         if nome == "enviados_sem_resposta":
-            return await g.enviados_sem_resposta(a.get("dias_min", self.cfg.dias_sem_resposta),
-                                                 ignorar=self.cfg.remetentes_ignorados)
+            lista = await g.enviados_sem_resposta(a.get("dias_min", self.cfg.dias_sem_resposta),
+                                                  ignorar=self.cfg.remetentes_ignorados)
+            return compacto.sem_resposta(lista, self.refs)
         if nome == "listar_eventos":
             ini, fim = _dt(a["inicio"], fuso), _dt(a["fim"], fuso)
             if len(a["fim"]) == 10:
                 fim += timedelta(days=1)  # data sem hora → inclui o dia inteiro
-            return await g.listar_eventos(ini, fim)
+            return compacto.eventos(await g.listar_eventos(ini, fim), self.refs, await g.meu_email())
         if nome == "horarios_livres":
             return await self._horarios_livres(a["duracao_min"], a.get("a_partir_de"), a.get("dias", 5))
 
@@ -259,6 +274,22 @@ mensagens de {", ".join(self.cfg.contatos_prioritarios)}.
         ocupados = [(_dt(e["inicio"], fuso), _dt(e["fim"], fuso)) for e in eventos
                     if not e["dia_inteiro"] and e["minha_resposta"] != "declined"]
         return calcular_janelas(ocupados, inicio, agora, dias, duracao, fuso)
+
+
+def _com_cache(msgs: list[dict]) -> list[dict]:
+    """Marca a última mensagem para cache: nas etapas seguintes do mesmo pedido, todo o contexto já enviado
+    é relido do cache a 10% do preço (escrita custa 1,25×, compensa a partir da 2ª etapa)."""
+    if not msgs:
+        return msgs
+    ultima = dict(msgs[-1])
+    conteudo = ultima["content"]
+    if isinstance(conteudo, str):
+        conteudo = [{"type": "text", "text": conteudo}]
+    conteudo = list(conteudo)
+    if conteudo and isinstance(conteudo[-1], dict):
+        conteudo[-1] = {**conteudo[-1], "cache_control": {"type": "ephemeral"}}
+    ultima["content"] = conteudo
+    return msgs[:-1] + [ultima]
 
 
 SEMANA = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]

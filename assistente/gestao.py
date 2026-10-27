@@ -18,6 +18,8 @@ INTEGRACOES = {
     "claude": "Claude (Anthropic)",
     "openai": "Transcrição de voz (OpenAI)",
 }
+ORIGENS_ROTINA = {"briefing", "pendencias", "fim_dia", "reuniao"}
+MODELOS_ROTINAS = {"claude-haiku-4-5": "Claude Haiku 4.5 (mais barato)", "claude-sonnet-4-5": "Claude Sonnet 4.5"}
 ORIGENS = {
     "conversa": "Conversas por texto", "voz": "Conversas por voz", "transcricao": "Transcrição de áudio",
     "briefing": "Briefing matinal", "pendencias": "Cobrança de pendências", "fim_dia": "Resumo do fim do dia",
@@ -78,11 +80,25 @@ class Gestor:
         except ValueError:
             return padrao
 
-    def precos(self) -> dict[str, float]:
-        ent, sai = custos.precos_claude(self.cfg.modelo)
+    def modelo_rotinas(self) -> str:
+        return self.banco.ajuste("modelo_rotinas", self.cfg.modelo_rotinas)
+
+    def salvar_modelo_rotinas(self, modelo: str) -> None:
+        if modelo not in MODELOS_ROTINAS and modelo != self.cfg.modelo:
+            raise ValueError("Modelo desconhecido")
+        self.banco.salvar_ajuste("modelo_rotinas", modelo)
+
+    def modelo_para(self, origem: str) -> str:
+        return self.modelo_rotinas() if origem in ORIGENS_ROTINA else self.cfg.modelo
+
+    def precos(self, modelo: str | None = None) -> dict[str, float]:
+        """Preços do modelo de conversa podem ser editados no painel; os demais vêm da tabela."""
+        modelo = modelo or self.cfg.modelo
+        ent, sai = custos.precos_claude(modelo)
+        editavel = modelo == self.cfg.modelo
         return {
-            "entrada": self._num("preco_entrada", ent),
-            "saida": self._num("preco_saida", sai),
+            "entrada": self._num("preco_entrada", ent) if editavel else ent,
+            "saida": self._num("preco_saida", sai) if editavel else sai,
             "audio": self._num("preco_audio_min",
                                custos.PRECOS_AUDIO.get(self.cfg.modelo_transcricao, custos.PRECO_PADRAO_AUDIO)),
         }
@@ -110,7 +126,7 @@ class Gestor:
 
     # ------------------------------------------------------------ registro de uso
     def registrar_claude(self, modelo: str, uso, origem: str) -> float:
-        p = self.precos()
+        p = self.precos(modelo)
         ent = getattr(uso, "input_tokens", 0) or 0
         sai = getattr(uso, "output_tokens", 0) or 0
         ce = getattr(uso, "cache_creation_input_tokens", 0) or 0

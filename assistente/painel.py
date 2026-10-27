@@ -18,7 +18,7 @@ from urllib.parse import quote
 
 from aiohttp import web
 
-from .gestao import INTEGRACOES, ORIGENS, ROTINAS
+from .gestao import INTEGRACOES, MODELOS_ROTINAS, ORIGENS, ROTINAS
 
 if TYPE_CHECKING:
     from .bot import Bot
@@ -179,6 +179,8 @@ class Painel:
                     raise ValueError(f"Horário inválido em {rotulo}")
                 horas[chave] = f"{int(hh):02d}:{int(mm):02d}"
             minutos = int(d.get("reuniao_minutos", "15"))
+            if d.get("modelo_rotinas"):
+                self.gestor.salvar_modelo_rotinas(str(d["modelo_rotinas"]))
             self.gestor.salvar_reunioes(d.get("reuniao_ativa") == "on", minutos)
             for chave, hora in horas.items():
                 self.gestor.salvar_rotina(chave, d.get(f"{chave}_ativa") == "on", hora)
@@ -262,7 +264,7 @@ class Painel:
         serie = [((ini30 + timedelta(days=i)), por_dia.get((ini30 + timedelta(days=i)).isoformat(), 0.0))
                  for i in range(30)]
         origens = self.banco.uso_agrupado(ini_mes, fim_mes, "origem")
-        provedores = self.banco.uso_agrupado(ini_mes, fim_mes, "provedor")
+        provedores = self.banco.uso_agrupado(ini_mes, fim_mes, "modelo")
 
         flash = f'<div class="flash" role="status">{escape(msg)}</div>' if msg else ""
         return _pagina("Atlas · Painel", f"""
@@ -297,7 +299,7 @@ class Painel:
       {_barras_horizontais(origens)}
     </div>
     <div class="cartao">
-      <h3>Por serviço · mês atual</h3>
+      <h3>Por modelo · mês atual</h3>
       {self._tabela_provedores(provedores, cot)}
     </div>
   </div>
@@ -342,7 +344,8 @@ class Painel:
 </div>"""
 
     def _tabela_provedores(self, prov: list[dict], cot: float) -> str:
-        nomes = {"claude": "Claude (Anthropic)", "openai": "Transcrição (OpenAI)"}
+        nomes = {**MODELOS_ROTINAS, "gpt-4o-transcribe": "Transcrição (OpenAI)",
+                 "gpt-4o-mini-transcribe": "Transcrição mini (OpenAI)", "whisper-1": "Transcrição Whisper (OpenAI)"}
         linhas = "".join(
             f"<tr><td>{escape(nomes.get(p['nome'], p['nome']))}</td><td class='n'>{p['chamadas']}</td>"
             f"<td class='n'>{usd(p['custo'])}</td><td class='n'>{brl(p['custo'] * cot)}</td></tr>" for p in prov)
@@ -350,7 +353,7 @@ class Painel:
         linhas += (f"<tr class='fixo'><td>Railway (custo fixo informado)</td><td class='n'>—</td>"
                    f"<td class='n'>{usd(fixo)}</td><td class='n'>{brl(fixo * cot)}</td></tr>")
         total = sum(p["custo"] for p in prov) + fixo
-        return (f"<table><thead><tr><th>Serviço</th><th class='n'>Chamadas</th><th class='n'>US$</th>"
+        return (f"<table><thead><tr><th>Modelo</th><th class='n'>Chamadas</th><th class='n'>US$</th>"
                 f"<th class='n'>R$</th></tr></thead><tbody>{linhas}</tbody><tfoot><tr><td>Total do mês</td>"
                 f"<td></td><td class='n'>{usd(total)}</td><td class='n'>{brl(total * cot)}</td></tr></tfoot></table>"
                 f"<p class='nota'>O limite mensal considera só IA (Claude + OpenAI), não o Railway.</p>")
@@ -426,6 +429,9 @@ class Painel:
         r_ativa, r_min = g.reunioes()
         aviso = ("<p class='status critico'>✕ Limite mensal atingido: as rotinas estão pausadas até o próximo mês "
                  "ou até você aumentar o limite.</p>" if g.rotinas_bloqueadas() else "")
+        atual = g.modelo_rotinas()
+        opcoes_modelo = "".join(f'<option value="{m}" {"selected" if m == atual else ""}>{escape(n)}</option>'
+                                for m, n in MODELOS_ROTINAS.items())
         forms_rodar = "".join(f'<form id="rodar_{c}" method="post" action="/painel/rodar/{c}"></form>' for c in ROTINAS)
         return f"""{aviso}
 <form method="post" action="/painel/rotinas" class="cartao">
@@ -438,6 +444,10 @@ class Painel:
       <td></td>
     </tr></tbody>
   </table>
+  <label class="modelo">Modelo usado nas rotinas
+    <select name="modelo_rotinas">{opcoes_modelo}</select>
+    <span class="ajuda">Haiku custa cerca de 1/3 do Sonnet. As conversas continuam em {escape(self.cfg.modelo)}.</span>
+  </label>
   <button type="submit">Salvar rotinas</button>
 </form>{forms_rodar}"""
 
@@ -452,7 +462,7 @@ class Painel:
   {campo("limite", "Limite mensal de IA (US$)", g.limite_mensal(), "0 = sem limite. Aviso em 80%; em 100% pausa as rotinas automáticas.")}
   {campo("cotacao", "Cotação US$ → R$", g.cotacao(), "Usada só para exibir valores em reais. Atualize quando quiser.", "0.0001")}
   {campo("custo_fixo", "Custo fixo do Railway (US$/mês)", g.custo_fixo(), "Veja o valor real em railway.com → Usage.")}
-  {campo("preco_entrada", "Claude · entrada (US$ por milhão de tokens)", p['entrada'], f"Modelo {escape(self.cfg.modelo)}. Cache: 1,25× na escrita, 0,1× na leitura.", "0.001")}
+  {campo("preco_entrada", "Claude · entrada (US$ por milhão de tokens)", p['entrada'], f"Modelo das conversas ({escape(self.cfg.modelo)}). Cache: 1,25× na escrita, 0,1× na leitura. Haiku usa a tabela padrão.", "0.001")}
   {campo("preco_saida", "Claude · saída (US$ por milhão de tokens)", p['saida'], "Confira em anthropic.com/pricing.", "0.001")}
   {campo("preco_audio", "OpenAI · transcrição (US$ por minuto)", p['audio'], f"Modelo {escape(self.cfg.modelo_transcricao)}.", "0.0001")}
   <div class="span"><button type="submit">Salvar limite e preços</button></div>
@@ -609,6 +619,8 @@ button.sec{background:transparent;color:var(--tinta);border:1px solid var(--base
 input{font:inherit;color:var(--tinta);background:var(--pagina);border:1px solid var(--base);border-radius:8px;padding:7px 9px;min-height:38px}
 input[type=checkbox]{min-height:auto;width:18px;height:18px;vertical-align:middle;accent-color:var(--acento)}
 .chk{display:flex;align-items:center;gap:8px}
+.modelo{display:flex;flex-direction:column;gap:4px;font-size:13px;font-weight:600;margin:12px 0;max-width:420px}
+select{font:inherit;color:var(--tinta);background:var(--pagina);border:1px solid var(--base);border-radius:8px;padding:7px 9px;min-height:38px}
 table.form td{vertical-align:middle}table.form input[type=number]{width:80px}
 form.gridform{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
 form.gridform label{display:flex;flex-direction:column;gap:4px;font-size:13px;font-weight:600}
