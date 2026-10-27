@@ -17,6 +17,7 @@ Bot do Telegram que conversa com você usando o Claude e tem acesso ao seu Outlo
 
 - **Mensagens de voz:** grave um áudio no Telegram e o bot transcreve (OpenAI), mostra o que entendeu e responde como se fosse texto.
 - **Painel web** (`/painel`): custos de IA por dia e por tipo de uso, limite mensal com alerta, status das integrações (com "Testar agora" e "Refazer login do Microsoft 365") e liga/desliga e horário das rotinas.
+- **Economia de tokens:** e-mails e eventos vão ao Claude em formato compacto (com referências curtas no lugar dos IDs do Outlook), o contexto fica em cache entre as etapas de cada pedido e as rotinas usam o Claude Haiku (configurável no painel).
 - Comandos: `/briefing` `/pendencias` `/fimdodia` `/agenda` `/limpar` `/login` `/ajuda`
 - Só responde ao seu chat id. Qualquer outra pessoa é ignorada.
 
