@@ -46,6 +46,10 @@ class Config:
     ms_client_id: str = field(default_factory=lambda: _env("MS_CLIENT_ID", ""))
     ms_tenant_id: str = field(default_factory=lambda: _env("MS_TENANT_ID", "organizations"))
 
+    # Painel web (opcional: só sobe se PAINEL_SENHA estiver definida)
+    painel_senha: str = field(default_factory=lambda: _env("PAINEL_SENHA", ""))
+    porta: int = field(default_factory=lambda: _int("PORT", 8080))
+
     # Persistência
     pasta_dados: Path = field(default_factory=lambda: Path(_env("DATA_DIR", "./data")))
 

@@ -50,3 +50,17 @@ class Transcritor:
         if not texto:
             raise ErroTranscricao("Não consegui entender o áudio. Pode repetir?")
         return texto
+
+    async def testar(self) -> tuple[bool, str]:
+        """Confere se a chave é válida e o modelo existe (não gera custo)."""
+        try:
+            async with httpx.AsyncClient(timeout=20) as http:
+                r = await http.get(f"https://api.openai.com/v1/models/{self.modelo}",
+                                   headers={"Authorization": f"Bearer {self.api_key}"})
+        except Exception as e:
+            return False, str(e)
+        if r.status_code == 200:
+            return True, self.modelo
+        if r.status_code == 401:
+            return False, "OPENAI_API_KEY inválida"
+        return False, f"OpenAI {r.status_code}: {r.text[:150]}"

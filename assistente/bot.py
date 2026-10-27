@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time as _time
 from datetime import time, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -15,6 +16,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
 from .agente import Agente, Resposta, cancelar_acao, executar_acao
 from .armazenamento import Armazenamento
 from .config import Config
+from .gestao import ROTINAS, Gestor
 from .graph import Autenticador, ErroGraph, Graph
 from .rotinas import Rotinas
 from .transcricao import ErroTranscricao, Transcritor
@@ -44,13 +46,29 @@ class Bot:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.banco = Armazenamento(cfg.arquivo_db)
+        self.gestor = Gestor(cfg, self.banco)
         self.graph = Graph(Autenticador(cfg.ms_client_id, cfg.ms_tenant_id, cfg.arquivo_token), cfg.fuso.key)
-        self.agente = Agente(cfg, self.graph, self.banco)
+        self.graph.ao_status = lambda ok, erro=None: self.gestor.status("microsoft365", ok, erro)
+        self.agente = Agente(cfg, self.graph, self.banco, gestor=self.gestor)
         self.rotinas = Rotinas(self.agente)
         self.transcritor = Transcritor(cfg.openai_api_key, cfg.modelo_transcricao, cfg.contatos_prioritarios)
         self.trava = asyncio.Lock()  # uma conversa por vez, para manter o histórico coerente
+        self.app: Application | None = None
+        self.login_m365: dict | None = None  # login em andamento (mostrado no painel)
+        self.painel = None
 
     # ------------------------------------------------------------ envio
+    async def avisar(self, texto: str) -> None:
+        """Mensagem simples ao Matheus, registrando o status do Telegram."""
+        if not self.app:
+            return
+        try:
+            await self.app.bot.send_message(self.cfg.chat_id_autorizado, texto, disable_web_page_preview=True)
+            self.gestor.status("telegram", True)
+        except Exception as e:
+            self.gestor.status("telegram", False, str(e))
+            log.warning("Falha ao enviar mensagem no Telegram: %s", e)
+
     async def enviar(self, app: Application, resp: Resposta) -> None:
         cid = self.cfg.chat_id_autorizado
         for p in _partes(resp.texto):
@@ -61,16 +79,22 @@ class Bot:
                 InlineKeyboardButton("❌ Cancelar", callback_data=f"no:{a['id']}")]])
             await app.bot.send_message(cid, _partes(a["resumo"])[0], reply_markup=teclado)
 
-    async def _rodar(self, app: Application, nome: str, coro_fn) -> None:
+    async def _rodar(self, app: Application, nome: str, coro_fn, automatica: bool = False) -> None:
+        if automatica and self.gestor.rotinas_bloqueadas():
+            log.info("Rotina '%s' pulada: limite mensal de gasto atingido", nome)
+            return
         async with self.trava:
             try:
                 await app.bot.send_chat_action(self.cfg.chat_id_autorizado, ChatAction.TYPING)
                 await self.enviar(app, await coro_fn())
+                self.gestor.status("telegram", True)
             except ErroGraph as e:
-                await app.bot.send_message(self.cfg.chat_id_autorizado, f"⚠️ Outlook: {e}")
+                await self.avisar(f"⚠️ Outlook: {e}")
             except Exception as e:
                 log.exception("Falha em %s", nome)
-                await app.bot.send_message(self.cfg.chat_id_autorizado, f"⚠️ Falha em {nome}: {e}")
+                await self.avisar(f"⚠️ Falha em {nome}: {e}")
+        for alerta in self.gestor.alertas_de_limite():
+            await self.avisar(alerta)
 
     # ------------------------------------------------------------ handlers
     async def h_texto(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -96,14 +120,19 @@ class Bot:
                 nome = nome[:-4] + ".ogg"
             texto = await self.transcritor.transcrever(audio, nome)
         except ErroTranscricao as e:
+            if "configurada" not in str(e) and "grande" not in str(e) and "entender" not in str(e):
+                self.gestor.status("openai", False, str(e))
             await msg.reply_text(f"⚠️ {e}")
             return
         except Exception as e:
+            self.gestor.status("openai", False, str(e))
             log.exception("Falha ao transcrever")
             await msg.reply_text(f"⚠️ Falha ao transcrever o áudio: {e}")
             return
+        self.gestor.status("openai", True)
+        self.gestor.registrar_audio(self.cfg.modelo_transcricao, float(getattr(midia, "duration", 0) or 0))
         await msg.reply_text(f"🎙️ Entendi: “{texto}”")
-        await self._rodar(ctx.application, "conversa", lambda: self.agente.conversar(texto))
+        await self._rodar(ctx.application, "conversa", lambda: self.agente.conversar(texto, origem="voz"))
 
     async def h_botao(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -136,31 +165,72 @@ class Bot:
             "• marca 30 min com o Marcelo quinta à tarde\n\n"
             "Comandos: /briefing /pendencias /fimdodia /agenda /limpar /login")
 
-    async def c_login(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Login no Microsoft 365 pelo próprio Telegram (device code) — não precisa de terminal no servidor."""
+    async def iniciar_login_m365(self) -> dict:
+        """Gera o código de login do Microsoft 365 e conclui em segundo plano (usado pelo /login e pelo painel)."""
         auth = self.graph.auth
-        try:
-            fluxo = await asyncio.to_thread(auth.iniciar_login)
-        except ErroGraph as e:
-            await update.message.reply_text(f"⚠️ {e}")
-            return
-        await update.message.reply_text(
-            "🔐 Login no Microsoft 365\n"
-            f"1. Abra: {fluxo['verification_uri']}\n"
-            f"2. Digite o código: {fluxo['user_code']}\n"
-            "3. Entre com sua conta @larcacapital.com.br e aceite as permissões.\n\n"
-            "O código vale 15 minutos. Eu aviso aqui quando concluir.")
+        fluxo = await asyncio.to_thread(auth.iniciar_login)
+        self.login_m365 = {"url": fluxo["verification_uri"], "codigo": fluxo["user_code"],
+                           "expira": _time.time() + int(fluxo.get("expires_in", 900)), "status": "aguardando"}
+        estado = self.login_m365
 
         async def aguardar() -> None:
             try:
                 await asyncio.to_thread(auth.concluir_login, fluxo)
                 self.graph._eu = None
                 eu = await self.graph.eu()
-                msg = f"✅ Conectado como {eu.get('displayName')} ({eu.get('mail')}). Pode começar!"
+                estado["status"] = "concluido"
+                await self.avisar(f"✅ Microsoft 365 conectado como {eu.get('displayName')} ({eu.get('mail')}).")
             except Exception as e:
-                msg = f"⚠️ Login não concluído: {e}"
-            await ctx.bot.send_message(self.cfg.chat_id_autorizado, msg)
-        ctx.application.create_task(aguardar())
+                estado["status"] = f"falhou: {e}"
+                self.gestor.status("microsoft365", False, f"Login não concluído: {e}")
+                await self.avisar(f"⚠️ Login do Microsoft 365 não concluído: {e}")
+        if self.app:
+            self.app.create_task(aguardar())
+        else:
+            asyncio.get_running_loop().create_task(aguardar())
+        return self.login_m365
+
+    async def c_login(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Login no Microsoft 365 pelo próprio Telegram (device code) — não precisa de terminal no servidor."""
+        try:
+            lg = await self.iniciar_login_m365()
+        except ErroGraph as e:
+            await update.message.reply_text(f"⚠️ {e}")
+            return
+        await update.message.reply_text(
+            "🔐 Login no Microsoft 365\n"
+            f"1. Abra: {lg['url']}\n"
+            f"2. Digite o código: {lg['codigo']}\n"
+            "3. Entre com sua conta @larcacapital.com.br e aceite as permissões.\n\n"
+            "O código vale 15 minutos. Eu aviso aqui quando concluir.")
+
+    async def testar_integracoes(self) -> dict[str, tuple[bool, str]]:
+        """Teste ativo de cada integração (botão 'Testar agora' do painel)."""
+        res: dict[str, tuple[bool, str]] = {}
+        try:
+            eu = await self.app.bot.get_me()
+            res["telegram"] = (True, f"@{eu.username}")
+        except Exception as e:
+            res["telegram"] = (False, str(e))
+        try:
+            self.graph._eu = None
+            eu = await self.graph.eu()
+            res["microsoft365"] = (True, eu.get("mail") or eu.get("userPrincipalName") or "")
+        except Exception as e:
+            res["microsoft365"] = (False, str(e))
+        try:
+            await self.agente.claude.models.list(limit=1)
+            res["claude"] = (True, self.cfg.modelo)
+        except Exception as e:
+            res["claude"] = (False, str(e))
+        if self.transcritor.ativo:
+            ok, det = await self.transcritor.testar()
+            res["openai"] = (ok, det)
+        else:
+            res["openai"] = (False, "OPENAI_API_KEY não configurada")
+        for nome, (ok, det) in res.items():
+            self.gestor.status(nome, ok, None if ok else det)
+        return res
 
     async def c_meuid(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Seu chat id: {update.effective_chat.id}")
@@ -176,7 +246,8 @@ class Bot:
 
     async def c_agenda(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await self._rodar(ctx.application, "agenda",
-                          lambda: self.agente.conversar("Qual é a minha agenda de hoje e de amanhã?"))
+                          lambda: self.agente.conversar("Qual é a minha agenda de hoje e de amanhã?",
+                                                       origem="agenda"))
 
     async def c_limpar(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         self.banco.limpar_historico()
@@ -184,15 +255,17 @@ class Bot:
 
     # ------------------------------------------------------------ jobs agendados
     async def j_briefing(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._rodar(ctx.application, "briefing", self.rotinas.briefing)
+        await self._rodar(ctx.application, "briefing", self.rotinas.briefing, automatica=True)
 
     async def j_pendencias(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._rodar(ctx.application, "pendências", self.rotinas.pendencias)
+        await self._rodar(ctx.application, "pendências", self.rotinas.pendencias, automatica=True)
 
     async def j_fim_dia(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._rodar(ctx.application, "fim do dia", self.rotinas.fim_do_dia)
+        await self._rodar(ctx.application, "fim do dia", self.rotinas.fim_do_dia, automatica=True)
 
     async def j_reunioes(self, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.gestor.reunioes()[0] or self.gestor.rotinas_bloqueadas() or not self.graph.auth.conectado():
+            return
         try:
             proximas = await self.rotinas.reunioes_proximas()
         except Exception:
@@ -200,11 +273,23 @@ class Bot:
             return
         for ev in proximas:
             await self._rodar(ctx.application, "preparo de reunião",
-                              lambda ev=ev: self.rotinas.preparar_reuniao(ev))
+                              lambda ev=ev: self.rotinas.preparar_reuniao(ev), automatica=True)
+
+    def agendar_rotinas(self) -> None:
+        """(Re)agenda as rotinas diárias conforme os ajustes do painel. Pode ser chamado a qualquer momento."""
+        jq = self.app.job_queue
+        funcoes = {"briefing": self.j_briefing, "pendencias": self.j_pendencias, "fim_dia": self.j_fim_dia}
+        for chave in ROTINAS:
+            for job in jq.get_jobs_by_name(chave):
+                job.schedule_removal()
+            ativa, (hh, mm) = self.gestor.rotina(chave)
+            if ativa:
+                jq.run_daily(funcoes[chave], time(hh, mm, tzinfo=self.cfg.fuso), days=DIAS_UTEIS, name=chave)
 
     # ------------------------------------------------------------ montagem
     def construir(self) -> Application:
         app = Application.builder().token(self.cfg.telegram_token).build()
+        self.app = app
         dono = filters.Chat(chat_id=self.cfg.chat_id_autorizado)
 
         app.add_handler(CommandHandler("meuid", self.c_meuid))  # livre: ajuda a descobrir o chat id
@@ -221,27 +306,31 @@ class Bot:
         app.add_handler(CallbackQueryHandler(self.h_botao, pattern=r"^(ok|no):"))
         # qualquer outra pessoa é ignorada em silêncio
 
-        jq, fz = app.job_queue, self.cfg.fuso
-        h = lambda hm: time(hm[0], hm[1], tzinfo=fz)  # noqa: E731
-        jq.run_daily(self.j_briefing, h(self.cfg.hora_briefing), days=DIAS_UTEIS, name="briefing")
-        jq.run_daily(self.j_pendencias, h(self.cfg.hora_pendencias), days=DIAS_UTEIS, name="pendencias")
-        jq.run_daily(self.j_fim_dia, h(self.cfg.hora_fim_dia), days=DIAS_UTEIS, name="fim_dia")
-        jq.run_repeating(self.j_reunioes, interval=timedelta(minutes=5), first=20, name="reunioes")
+        self.agendar_rotinas()
+        app.job_queue.run_repeating(self.j_reunioes, interval=timedelta(minutes=5), first=20, name="reunioes")
 
         async def ao_iniciar(_app: Application) -> None:
             eu = await _app.bot.get_me()
             log.info("Bot @%s no ar. Chat autorizado: %s", eu.username, self.cfg.chat_id_autorizado)
             msg = ("Estou no ar. ✅ Outlook conectado." if self.graph.auth.conectado()
                    else "Estou no ar, mas ainda sem acesso ao seu Outlook. Mande /login.")
+            if self.cfg.painel_senha:
+                from .painel import Painel
+                self.painel = Painel(self)
+                await self.painel.iniciar()
             try:
                 await _app.bot.send_message(self.cfg.chat_id_autorizado, msg)
+                self.gestor.status("telegram", True)
             except Exception as e:  # não derruba o bot: só avisa no log
+                self.gestor.status("telegram", False, str(e))
                 log.warning("Não consegui mandar mensagem para o chat %s (%s). Abra o bot @%s no Telegram, "
                             "toque em Iniciar/Start e confira se TELEGRAM_CHAT_ID é o seu Id do @userinfobot.",
                             self.cfg.chat_id_autorizado, e, eu.username)
         app.post_init = ao_iniciar
 
         async def ao_parar(_app: Application) -> None:
+            if self.painel:
+                await self.painel.parar()
             await self.graph.fechar()
         app.post_shutdown = ao_parar
         return app
