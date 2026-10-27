@@ -15,6 +15,8 @@ Bot do Telegram que conversa com você usando o Claude e tem acesso ao seu Outlo
 | Resumo do fim do dia | 18:30 | O que aconteceu hoje, o que ficou pendente e a agenda de amanhã |
 | Preparo de reunião | 15 min antes | Quem participa, contexto dos últimos e-mails e pontos em aberto |
 
+- **Mensagens de voz:** grave um áudio no Telegram e o bot transcreve (OpenAI), mostra o que entendeu e responde como se fosse texto.
+- **Painel web** (`/painel`): custos de IA por dia e por tipo de uso, limite mensal com alerta, status das integrações (com "Testar agora" e "Refazer login do Microsoft 365") e liga/desliga e horário das rotinas.
 - Comandos: `/briefing` `/pendencias` `/fimdodia` `/agenda` `/limpar` `/login` `/ajuda`
 - Só responde ao seu chat id. Qualquer outra pessoa é ignorada.
 
@@ -41,6 +43,9 @@ São permissões *delegadas*: o bot só enxerga a **sua** caixa, nunca a dos out
 
 ### 3. Chave do Claude
 [console.anthropic.com](https://console.anthropic.com) → **API Keys** → criar. Configure também um limite de gasto mensal em **Billing → Limits**.
+
+### 3b. Chave da OpenAI (só para mensagens de voz)
+[platform.openai.com](https://platform.openai.com) → **API keys** → *Create new secret key*. Adicione créditos em **Billing** e defina um limite mensal. No Railway, crie a variável `OPENAI_API_KEY`. Opcional: `TRANSCRICAO_MODELO=gpt-4o-mini-transcribe`, que é mais barato.
 
 ### 4. Hospedagem na sua conta Railway (sem servidor da LARCA)
 Plano Hobby, a partir de cerca de US$ 5/mês, pago no seu cartão. Confira os valores em [docs.railway.com/pricing](https://docs.railway.com/pricing/plans).
@@ -70,6 +75,13 @@ docker compose up -d --build     # depois mande /login no Telegram
 
 ---
 
+### 5. Painel web
+1. No Railway, em **Variables**, crie `PAINEL_SENHA` com uma senha forte (12+ caracteres).
+2. No card do bot, vá em **Settings → Networking → Generate Domain**. Se ele pedir a porta, informe `8080`.
+3. Abra `https://<domínio-gerado>/painel` e entre com a senha.
+
+O painel bloqueia por 15 minutos depois de 5 senhas erradas, e a sessão dura 7 dias. Trocar a `PAINEL_SENHA` derruba todas as sessões abertas.
+
 ## Segurança e LGPD (leia antes de ligar)
 - **O volume `/data` guarda o login do seu e-mail.** Proteja a conta do Railway e a do GitHub com autenticação em dois fatores (2FA) e não convide ninguém para o projeto. O bot não abre nenhuma porta pública, porque usa *polling*.
 - Para revogar o acesso a qualquer momento: em [myaccount.microsoft.com](https://myaccount.microsoft.com) → *Aplicativos*, ou peça ao administrador para desativar o app no Entra ID.
@@ -90,7 +102,6 @@ tests/             testes com Graph e Claude simulados (python -m pytest -q)
 ```
 
 ## Próximos passos possíveis
-- Mensagens de voz (transcrição de áudio antes de enviar ao Claude).
 - Teams (ler e enviar chats): basta adicionar as permissões `Chat.Read`/`ChatMessage.Send` e novas ferramentas.
 - Consultar o vault LARCA_BRAIN para dar contexto nas reuniões.
 - WhatsApp como segundo canal, depois da aprovação da conta Meta Business.
